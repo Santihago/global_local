@@ -1,0 +1,127 @@
+---
+title: "Joystick preprocessing"
+---
+
+Open joystick data .csv files. Note these files have no column names.
+A trial is a row but different blocks are in different columns. The first column indicates the id number.
+
+```{r}
+library(tidyverse)
+```
+
+# Load trial information datafiles (acquired after runnning trialcode_addition.m on saloglo_input.mat)
+
+```{r}
+
+# TRIAL INFO
+
+trl_info_path <- 'D:\\Dropbox\\MyScience\\MyPostdoc\\exp\\global_local\\2-data\\trial_info\\2-csv'
+
+# select specific files inside folder
+files = dir(path=trl_info_path, patter='trial_info')
+
+trial_info <- files %>%
+  # read in all the files, appending the path before the filename
+  map(~ read_csv(file.path(trl_info_path, .),  # the function read_csv() from the readr package
+                 col_types = cols("i", "i", "i", "f", "f", "f", "f", "f", "c"), 
+                 na = c("NaN"))) %>%
+  reduce(rbind)  %>%      # reduce with rbind into one dataframe
+  separate(trialcode, c("blocktype2", "salience", "lateness"), sep = c(1,2)) %>% #separate trialcode into three different columns
+  arrange(id, block, trial) %>%
+  rename(trial_in_block=trial) %>%
+  select(-blocktype2) %>% #redundant column
+  mutate(id = factor(id)) %>% 
+  mutate(block = factor(case_when((block == 7  | block == 8)  ~ block-1,
+                                  (block == 10 | block == 11) ~ block-2)))
+
+   #  Trialcode
+   #  % first digit: block type;
+   #  % second digit: salience:
+   #    % global standard is always 0;
+   #    % in block type 1 (glostd=locdev):
+   #    % X1=1 - change in ear;
+   #    % Y2=2 - change in pitch;
+   #  % third digit: count of lateness:
+   #    % test block (block 1) and block with no deviance (block 12) are
+   #    % excluded;
+   #    % first 15 trials of each block is given 0;
+   #    % each global deviant has value 0.
+
+# Trial info is complete for every trial (in long format).
+```
+
+# Load joystick datafiles (after having been converted from .mat to .csv using mat_to_csv.m)
+
+```{r}
+# JOYSTICK DATA
+
+joy_path <- 'D:\\Dropbox\\MyScience\\MyPostdoc\\exp\\global_local\\2-data\\joystick\\2-csv'
+
+# select specific files inside folder
+files = dir(path=joy_path, patter='joypos')
+
+# read each selected file and combine into a unique dataframe
+joy_data <- files %>%
+  # read in all the files, appending the path before the filename
+  map(~ read_csv(file.path(joy_path, .),  # the function read_csv() from the readr package
+                 col_names = c("id", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15"), 
+                 col_types = cols("i", "d", "d", "d", "d", "d", "d", "d", "d", "d", "d", "d", "d", "d", "d", "d"), 
+                 na = c("NaN", 0))) %>%
+  reduce(rbind) %>%  # reduce with rbind into one dataframe
+
+  # Note: ID 01 only has 15 columns, others have 16.
+  # Joystick data is not yet in long format. Further pre-processing is required.
+  transmute(id = id,
+            `6` = `7`,
+            `7` = `8`,
+            `8` = `10`,
+            `9` = `11`) %>%
+  group_by(id) %>%
+  mutate(trial_in_block = row_number()) %>%
+  pivot_longer(cols = c(`6`,`7`,`8`,`9`), names_to = 'block', values_to = 'value') %>%
+  drop_na() %>% # remove trials with value NA
+  arrange(id, block) %>%
+  mutate(trial = row_number()) %>%
+  mutate(id = factor(id)) %>% 
+  mutate(block = factor(block)) %>%
+  mutate(block_type = case_when( (block == 6 | block == 7) ~ 'Default',
+                                (block == 8 | block == 9) ~ 'Reversed')) %>%
+  select(id, block, block_type, trial, trial_in_block, value) 
+
+# Joystick data is now in long format. It can be merged with the trial info table.
+
+df <- left_join(trial_info, joy_data, by = c('id', 'block', 'trial_in_block'))
+
+# Further pre-processing is needed to normalize the joystick values.
+
+```
+
+## Joystick position values normalisation
+
+Possible joystick values are between 0 and √2.
+In blocks 6 and 7, participants were instructed that joystick(0)=prob(0) and 
+joystick(√2)=prob(100).
+In blocks 8 and 9, the values were reversed so joystick(√2)=prob(0) and joystick(0)=prob(100).
+
+I will create a new variable `prob` that corrects for reversal, and another au
+that normalizes for each block and id. In Yijie's report the denominator is said to be the max,
+but in reality it is max-min.
+
+```{r}
+df <- df %>%
+  mutate(prob = case_when((block_type == 'Default') ~ round((value/sqrt(2))*100, 2),
+                          (block_type == 'Reversed') ~ round(100-((value/sqrt(2))*100),2))) %>%
+  group_by(id, block) %>%
+  mutate(min_prob = min(prob), max_prob = max(prob)) %>%
+  mutate(au = round((prob-min_prob)/(max_prob-min_prob), 2)) %>%
+  mutate(value = round(value, 2)) %>%
+  ungroup() %>%
+  select(-min_prob, -max_prob)
+```
+
+```{r}
+out_fullfilename <- 'D:\\Dropbox\\MyScience\\MyPostdoc\\exp\\global_local\\2-data\\joystick\\3-preprocessed\\joystick.csv'
+write_csv(df, path= out_fullfilename)
+```
+
+
