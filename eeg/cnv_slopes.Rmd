@@ -1,0 +1,334 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+set.seed(123)
+```
+
+```{r}
+# folder containing individual datasets 
+path <- '/Users/santiago/Dropbox/MyScience/MyPostdoc/exp/global_local/3-analysis/eeg/4-R/DATA'
+
+# select specific files inside folder
+files = dir(path=path, patter='cnv_slopes_P')
+
+# read each selected file and combine into a unique dataframe
+data <- files %>%
+  # using cols_only() to select only a subset of columns from the CSV file
+  map(~ read_csv(file.path(path, .), 
+                 col_names = c("id", 
+                               "block", 
+                               "trial_in_block", 
+                               "blocktype", 
+                               "lateness",
+                               "slope"), 
+                 col_types = cols("f", 
+                                  "f", 
+                                  "i", 
+                                  "f", 
+                                  "i",
+                                  "d"), 
+                 na = c("NaN"))) %>%
+  reduce(rbind)
+
+# Separate trialcode into various columns (as is already the case in joystick_preprocessing.Rmd)
+
+#data <- data %>%
+#  #separate(trialcode, c("blocktype2", "salience", "lateness"), sep = c(1,2)) %>%
+#  mutate(lateness = as.numeric(substr(trialcode, nchar(trialcode), nchar(trialcode)))) # keep only last digit
+
+```
+
+# Load electrode labels and neighbours
+
+`elecinfo.csv` is the file with electrode labels and neighbours.
+```{r}
+# Load
+elecinfo <- read_csv('/Users/santiago/Dropbox/MyScience/MyPostdoc/exp/global_local/3-analysis/eeg/4-R/elecinfo.csv', col_types = cols('c', 'c') ) 
+
+# Add to data
+data_with_elecs <- data %>%
+  group_by(id, block, trial_in_block) %>%
+  mutate(elec = elecinfo$labels,
+         neighbours = elecinfo$neighbours)
+```
+
+
+# Merge with behavioral data 
+Note: in cnv slopes there are trials missing (trial nr start at >15).
+
+```{r}
+# Load behavioral metadata (only blocks 6-7-8-9)
+#read from online file
+metadata <- read_csv('https://www.dropbox.com/s/klfyv2hk78ko8a4/joystick.csv?dl=1',
+                     col_types = cols("f", "i", "i", "f", "f", "f", "f", "f", "i", "i", "f", "i", "d", "d", "d"))
+
+# Correct for block number (need the same in both)
+#data %>% summarise(block = unique(block))
+
+# revert block number change during preprocessing so it matches again with slope data
+
+metadata <- metadata %>%
+  mutate(block = factor(case_when((block == 6  | block == 7)  ~ block + 1,
+                                  (block == 8  | block == 9)  ~ block + 2))) %>%
+  select(-salience, -blocktype)
+
+```
+
+Join by `trial_in_block`
+
+```{r}
+#lateness <- metadata %>% select(trial_in_block, lateness)
+#rm(data)  #for memory issue
+
+joined <- data_with_elecs %>%
+  #filter(block < 6) %>%
+  left_join(., metadata, by = c('id', 'block', 'trial_in_block', 'lateness'))  #nest_join #inner_join
+
+# More clean up
+rm(data, data_with_elecs, elecinfo, metadata)
+
+# Remove lateness = 0
+df <- joined %>%
+  filter(lateness>0)
+```
+
+# Reduction of electrodes
+
+The following method is for data-driven eletrode selection. We skip it if we use the electrodes from the cluster-permutation.
+
+## Sampling of trials
+
+First, for each id, we will select a random subset of trials (__ %) per block to calculate the
+3 neighbouring electrodes with the strongest modulation of CNV slope with lateness.
+
+
+```{r, eval=FALSE}
+
+#How many trials per level for each id and each block
+df %>% group_by(id, block, lateness) %>% summarise(n=n()/91) -> summary
+#min is 12!!! for lateness 4
+
+#Select trials
+n_sel <- 10  #half will be lateness 1 and half lateness 4
+
+# Create vector of chosen trials
+# Make it different for each block and for each participant
+id_list <- list()
+block_list <- list()
+for (this_id in 1:21){
+  for (this_block in c(2:5, 7:8, 10:11, 13:16)){  #actuql block nrs in data
+    # find idx of lateness 1 and lateness 4 in each block to balance quantities
+    smaller_df <- df %>% ungroup() %>% filter(id==this_id, block==this_block)
+    indices_1 <- smaller_df %>% filter(lateness==1) %>% summarise(unique = unique(trial_in_block)) %>% pull()
+    indices_4 <- smaller_df %>% filter(lateness==4) %>% summarise(unique = unique(trial_in_block)) %>% pull()
+    #n <- length(smaller_df %>% summarise(unique = unique(trial_in_block)))
+    sampled_1 <- sample(x = indices_1, size = n_sel/2, replace = FALSE)
+    sampled_4 <- sample(x = indices_4, size = n_sel/2, replace = FALSE)
+    block_list[this_block] <- list(c(sampled_1, sampled_4))
+  }
+  id_list[this_id] <- list(block_list)
+  print(this_id)
+}
+
+# Sample same amount of lateness 1 and lateness 4
+
+# find idx of lateness 1 and lateness 4 in each block
+# combine them
+# use that as list instead of `x = 1:max_trial_index`
+
+# Select the sampled trials in a new dataframe
+df <- df %>%
+  rowwise() %>%
+  mutate(sel = case_when((trial_in_block %in% id_list[[as.numeric(as.character(id))]][[as.numeric(as.character(block))]]) ~ 'training',
+                         TRUE ~ 'validation'))  # NOT WORKING
+
+training <- df %>%
+  filter(sel=='training')
+
+validation <- df %>%
+  filter(sel == 'validation')
+```
+
+## Select best electrodes
+
+```{r, eval=FALSE}
+# Calculate for each id, all trials/blocks collapsed:
+# Difference between lateness 1 and 4 at each electrode
+# Rank electrodes by effect size
+topelecs <- training %>%
+  filter(lateness %in% c(1,4)) %>%
+  group_by(id, elec) %>%
+  summarise(mean_1 = mean(slope[lateness==1]),
+            mean_4 = mean(slope[lateness==4]),
+            mean_diff = abs(mean_4 - mean_1)) %>% #abs(mean_4 - mean_1)) %>%
+  arrange(id, -mean_diff) %>%
+  group_by(id) %>%
+  slice_head(n=3, .preserve = TRUE)  %>% # preserve id grouping
+  select(id, elec)
+
+ # Now take the validation data and only keep the top electrodes from the training data
+validation_simple <- validation %>%
+  semi_join(., topelecs, by = c('id', 'elec')) %>%
+  group_by(id, block, trial_in_block, lateness) %>% #to maintain lateness info
+  summarise(val = mean(slope))   # Reduce to one value per trial (instead of 3)
+
+```
+
+```{r}
+# List of electrodes from the cluster (from Matlab)
+cluster_elecs <- c('E5', 'E6', 'E7', 'E11', 'E12', 'E13', 'E106', 'E111', 'E112', 'E117', 'E118')
+  
+# Select only those electrodes
+topelecs <- df %>%
+  filter(elec %in% cluster_elecs) %>%
+  group_by(id, block, trial_in_block, lateness) %>%
+  summarise(cluster_slope = mean(slope, na.rm = T)) # Average across those electrodes
+
+```
+
+Model
+
+```{r}
+library(lmerTest)
+
+# HYPOTHESIS 1.
+mdl1 <- lmer(cluster_slope ~ lateness + (1+lateness|id), data = topelecs)
+summary(mdl1)
+#ranef(mdl)
+
+topelecs %>%
+  ggplot(aes(x=lateness, y=cluster_slope)) + 
+    geom_smooth(method='lm', alpha=.5, aes(group=id, color=id)) +
+  #geom_jitter(alpha=.1) +
+   stat_summary(fun.data = mean_cl_boot, geom = 'line') + 
+  stat_summary(fun.data = mean_cl_boot, geom = 'pointrange') +  
+  #facet_grid(~block) +
+  NULL
+
+```
+
+```{r}
+#HYPOTHESIS 5a
+# Part A vs Part B: does the effect of lateness increase in part B?
+
+topelecs <- topelecs %>%
+  mutate(part = case_when((block == 2 | block == 3 | block == 4 | block == 5) ~ 'A',
+                          (block == 7 | block == 8 | block == 10 |block == 11) ~ 'B',
+                          (block == 13 | block == 14 |block == 15 |block == 16) ~ 'C'))
+                          
+topelecs %>%
+  filter(part %in% c('A', 'B')) %>%
+  lmer(cluster_slope ~ lateness + part + (1|id), data = .) -> mdl5a1
+
+topelecs %>%
+  filter(part %in% c('A', 'B')) %>%
+  lmer(cluster_slope ~ lateness * part + (1|id), data = .) -> mdl5a2
+
+anova(mdl5a1, mdl5a2)
+
+# CCL: NO DIFFERENCE BETWEEN PART A AND PART B
+
+# HYPOTHESIS 5A CONTINUED
+# Part A vs Part C: does the effect of lateness also increase, depending on
+# participant's report?
+
+topelecs %>%
+  filter(part %in% c('A', 'C')) %>%
+  lmer(cluster_slope ~ lateness + part + (1|id), data = .) -> mdl5a3
+
+topelecs %>%
+  filter(part %in% c('A', 'C')) %>%
+  lmer(cluster_slope ~ lateness * part + (1|id), data = .) -> mdl5a4
+
+anova(mdl5a3, mdl5a4)
+
+# Add report instead of Part C:
+#case_when part C and reported yes: attended,
+#part C and reported no: not_attended,
+
+topelecs <- topelecs %>%
+  mutate(atte = case_when((id == 1) ~ 'n', (id == 2) ~ 'n', (id == 3) ~ 'y',
+                          (id == 4) ~ '?', (id == 5) ~ '?', (id == 6) ~ 'n',
+                          (id == 7) ~ 'n', (id == 8) ~ 'n', (id == 9) ~ 'n',
+                          (id == 10) ~ 'n', (id == 11) ~ 'n', (id == 12) ~ '?',
+                          (id == 13) ~ '?', (id == 14) ~ 'y', (id == 15) ~ 'y',
+                          (id == 16) ~ 'n', (id == 17) ~ 'n', (id == 18) ~ 'n',
+                          (id == 19) ~ 'y', (id == 20) ~ 'n', (id == 21) ~ 'y'))
+
+mdl5a5 <- topelecs %>%
+  filter(part %in% c('A', 'C')) %>%
+  filter(atte %in% c('y', 'n')) %>%
+  lmer(cluster_slope ~ lateness * part + (1|id), data = .)
+
+mdl5a6 <- topelecs %>%
+  filter(part %in% c('A', 'C')) %>%
+  filter(atte %in% c('y')) %>%
+  lmer(cluster_slope ~ lateness * part + (1|id), data = .)
+
+#anova(mdl5a5, mdl5a6)
+
+#CCL: NO INT EFFECT FOR ALL GROUP, STILL NO INT EFFECT BY ONLY KEEPING THOSE WHO REPORTED PREDICTING THE SEQUENCES
+
+
+# Another try
+mdl5a7 <- topelecs %>%
+  lmer(cluster_slope ~ lateness * part * atte + (1|id), data = .)
+
+summary(mdl5a7)
+
+#CCL: block effect for Y in last block? (not a lateness interaction)
+topelecs %>%
+  ggplot(aes(x=lateness, y=cluster_slope, group=id, color=id)) + 
+  #geom_jitter(alpha=.1) +
+  #geom_smooth(method='lm', se=F) +
+  facet_grid(atte~part) +
+  stat_summary(fun.data = mean_cl_boot, geom = 'line') + 
+  #stat_summary(fun.data = mean_cl_boot, geom = 'pointrange') +  
+  NULL
+
+
+```
+
+
+
+```{r}
+# New
+
+# HYPOTHESIS 1.
+# Electrodes as random variable
+#df %>%
+#  filter(elec %in% cluster_elecs) %>%
+#  lmer(slope ~ lateness + (1+lateness|id/elec), data = .) %>%
+#  summary()
+#ranef(mdl)
+
+# HYP 5
+# New
+
+topelecs2 <- df %>%
+  filter(elec %in% cluster_elecs)
+
+topelecs2 <- topelecs2 %>%
+  mutate(part = case_when((block == 2 | block == 3 | block == 4 | block == 5) ~ 'A',
+                          (block == 7 | block == 8 | block == 10 |block == 11) ~ 'B',
+                          (block == 13 | block == 14 |block == 15 |block == 16) ~ 'C'))
+
+topelecs2 <- topelecs2 %>%
+  mutate(atte = case_when((id == 1) ~ 'n', (id == 2) ~ 'n', (id == 3) ~ 'y',
+                          (id == 4) ~ '?', (id == 5) ~ '?', (id == 6) ~ 'n',
+                          (id == 7) ~ 'n', (id == 8) ~ 'n', (id == 9) ~ 'n',
+                          (id == 10) ~ 'n', (id == 11) ~ 'n', (id == 12) ~ '?',
+                          (id == 13) ~ '?', (id == 14) ~ 'y', (id == 15) ~ 'y',
+                          (id == 16) ~ 'n', (id == 17) ~ 'n', (id == 18) ~ 'n',
+                          (id == 19) ~ 'y', (id == 20) ~ 'n', (id == 21) ~ 'y'))
+
+
+topelecs2 %>%
+  lmer(slope ~ lateness * part * atte + (1+lateness|id/elec), data = .) %>%
+  summary()
+```
+

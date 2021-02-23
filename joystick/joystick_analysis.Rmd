@@ -1,0 +1,154 @@
+---
+title: "Joystick analysis"
+---
+
+# Load preprocessed dataset
+```{r}
+library(tidyverse)
+
+#read from online file
+df <- read_csv('https://www.dropbox.com/s/klfyv2hk78ko8a4/joystick.csv?dl=1',
+         col_types = cols("f", "f", "i", "f", "f", "f", "f", "f", "i", "i", "f", "i", "d", "d", "d"))
+
+#read from local drive
+#df <- read_csv('D:\\Dropbox\\MyScience\\MyPostdoc\\exp\\global_local\\2-data\\joystick\\3-preprocessed\\joystick.csv',
+#         col_types = cols("f", "f", "i", "f", "f", "f", "f", "f", "i", "i", "f", "i", "d", "d", "d"))
+```
+
+## Raw data visualisation
+
+```{r}
+df %>% 
+  ggplot(aes(x=block, y=value)) +
+    geom_jitter(size=.05, height = .0, width=.4) +
+    facet_wrap(id~.)
+
+df %>% 
+  ggplot(aes(x=block, y=prob)) +
+    geom_jitter(size=.05, height = .0, width=.4) +
+    facet_wrap(id~.)
+
+df %>% 
+  ggplot(aes(x=block, y=au)) +
+    geom_jitter(size=.05, height = .0, width=.4) +
+    facet_wrap(id~.)
+```
+
+```{r eval=F}
+df %>% 
+  filter(lateness>0) %>%
+  ggplot(aes(x=lateness, y=au)) +
+    geom_jitter(size=.1, width=.4, height=.0) +
+    geom_smooth(aes(group=id)) +
+    facet_wrap(id~.)
+
+df %>% 
+  filter(lateness>0) %>%
+  ggplot(aes(x=lateness, y=au)) +
+    geom_jitter(size=.1, width=.4, height=.0) +
+    geom_smooth() 
+```
+
+
+More preprocessing:
+- Issue with id=12?
+- add REAL likelihood of deviant to table?
+
+###
+
+- Remove unwanted trials (lateness = 0 : first 15 and globdev)
+- Equalize number of trials?
+
+## Analysis
+
+How many points are not 0 or 1?
+
+```{r}
+df %>%
+  group_by(id) %>%
+  summarise(
+    count_0 = sum(au<0.2),
+    count_1 = sum(au>0.8),
+    prop = round((count_0+count_1)/n(), 2)
+  ) %>%
+  arrange(prop)
+
+```
+
+# Linear mixed-model
+
+```{r eval=F}
+
+df_mdl %>%
+  lmerTest::lmer(
+    au ~ block + lateness + salience + (1|id), 
+    data=.) %>%
+  {. ->> mdl }
+
+summary(mdl)
+
+#coef(mdl)
+#ranef(mdl)
+
+mixed_model_df_fit <- df_mdl %>% 
+  ungroup() %>%
+  mutate(fit = predict(mdl))
+
+mixed_model_df_fit %>%
+  ggplot(aes(x=lateness, y=au)) + 
+    geom_hline(yintercept=0.5, linetype="dashed") +
+    #geom_violin(aes(groupsize = .2, width = .2, height = .0, alpha = .4) +
+    geom_violin(aes(group=lateness, fill=as.factor(block)), alpha=.4) +
+    #stat_summary(fun.y=mean, geom="line", size=.6) +
+    geom_smooth(aes(y=fit, group=id, colour=factor(id)), method = 'lm', se=FALSE, size=.5, alpha = .5) + 
+    #facet_wrap(id ~ .) +
+    theme_bw() + 
+    theme(aspect.ratio = 1, legend.position = 'right') +
+    NULL
+
+
+plot(residuals(mdl))
+hist(residuals(mdl))
+qqnorm(residuals(mdl))
+```
+
+
+
+
+# Bayesian model with brms
+
+
+```{r}
+library(brms)
+
+# Step 2. Subset data
+df_mdl <- df %>%
+  #filter(!id==12) %>%
+  filter(lateness > 0) 
+
+# Step 3. Plotting the data
+ggplot(data  = df_mdl,
+       aes(x = lateness,
+           y = au))+
+  geom_point(size = 1.2,
+             alpha = .8,
+             position = "jitter")+ # to add some random noise for plotting purposes
+  #geom_smooth(aes(y=fit, group=id, colour=factor(id)), method = 'lm', se=FALSE, size=.5, alpha = .5) +
+  theme_minimal()+
+  labs(title = "Rating by lateness")
+```
+
+Makes use of a Hamiltonian Monte Carlo sampler algorithm (MCMC) to approximate the posterior (distribution)
+
+https://www.rensvandeschoot.com/tutorials/brms-started/
+
+```{r}
+brm_model <- brm(au ~ 1 + (1 | id), 
+                              data   = df_mdl, 
+                              warmup = 100, 
+                              iter   = 200, 
+                              chains = 2, 
+                              inits  = "random",
+                              cores  = 2)  #the cores function tells STAN to make use of 2 CPU cores simultaneously instead of just 1.
+```
+
